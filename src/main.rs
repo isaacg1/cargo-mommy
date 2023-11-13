@@ -1,8 +1,7 @@
 #![allow(clippy::let_and_return)]
 
 use fastrand::Rng;
-
-include!(concat!(env!("OUT_DIR"), "/responses.rs"));
+use std::io::IsTerminal;
 
 enum ResponseType {
     Positive,
@@ -20,30 +19,132 @@ fn main() {
 }
 
 fn real_main() -> Result<i32, Box<dyn std::error::Error>> {
+    let rng = Rng::new();
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let mut arg_iter = std::env::args().peekable();
-    let _cargo = arg_iter.next();
-    if arg_iter.peek().map_or(false, |arg| arg == "mommy") {
-        let _mommy = arg_iter.next();
+
+    // Understand who mommy really is~
+    //
+    // *INHALES*
+    //
+    // Ok so first argument is this binary, should look like /some/path/to/cargo-mommy(.exe)
+    // but we want to let it instead be cargo-daddy, and for everything to rekey itself to:
+    // * make the default role be "daddy"
+    // * make all the read env-vars be "CARGO_DADDYS_*"
+
+    // Interpret the argument as a path so we can manipulate it~
+    let bin_path = std::path::PathBuf::from(arg_iter.next().unwrap_or_default());
+    // Get the extensionless-file name, and parse if case-insensitively~
+    let bin_name = bin_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    let true_role = if let Some((_path, role)) = bin_name.rsplit_once("cargo-") {
+        role.to_owned()
+    } else {
+        // If something messed up is going on "mommy" will always take care of it~
+        "mommy".to_owned()
+    };
+
+    // *GASPS FOR BREATH*
+    //
+    // *INHALES DESPERATELY*
+    //
+    // cargo subcommands when run as "cargo blah" get the "blah" argument passed to themselves
+    // as the *second* argument. However if we are invoked directly as "cargo-blah" we won't
+    // have that extra argument! So if there's a second argument that is "mommy" (or whatever)
+    // we pop off that redundant copy before forwarding the rest of the args back to "cargo ...".
+    // if we don't do this, we'll infinitely recurse into ourselves by re-calling "cargo mommy"!
+    // (note that it *is* supported to do `cargo mommy mommy` and get two messages, although I
+    // belive we do this, `cargo-mommy mommy` will still only get you onw message).
+
+    if arg_iter.peek().map_or(false, |arg| arg == &true_role) {
+        let _ = arg_iter.next();
     }
 
+    // *WHEEZES*
+    //
+    // *PANTS FOR A MINUTE*
+    //
+    // Ok so now we want to detect if the invocation looked like "cargo mommy i mean daddy"
+    // if it *does* we want to copy ourselves to rename cargo-mommy to cargo-daddy. We can't
+    // clone std::env::args() and we need to peek more than one element, so we create a
+    // "speculation" buffer that we will chain back into the args on failed speculation.
+    // on successful speculation we'll purge the buffer, effectively consuming the args.
+    //
+    // ...
+    //
+    // ~
+    let mut speculated = vec![];
+    {
+        // We speculate the "i mean" part so that can easily discard it
+        // in the case of "cargo mommy i mean mommy", making the execution
+        // equivalent to "cargo mommy mommy". Not popping off the extra
+        // "mommy" let "cargo mommy i mean mommy i mean mommy" work right~
+        speculated.extend(arg_iter.by_ref().take(2));
+        let new_role = arg_iter.peek();
+        let mean = speculated.get(1) == Some(&"mean".to_owned());
+        let i = speculated.get(0) == Some(&"i".to_owned());
+        if i && mean {
+            if let Some(new_role) = new_role.cloned() {
+                // Ok at this point we're confident we got "i mean <new_role>"
+                // so definitely consume the speculated arguments~
+                speculated.clear();
+
+                // If the new role is the same as before, they typed something like
+                // "cargo mommy i mean mommy test" so we don't need to do anything~
+                if new_role != true_role {
+                    if let Some(parent) = bin_path.parent() {
+                        let new_bin_name = format!("cargo-{new_role}");
+                        let mut new_bin_path = parent.join(new_bin_name);
+                        if let Some(ext) = bin_path.extension() {
+                            new_bin_path.set_extension(ext);
+                        }
+                        if let Err(e) = std::fs::copy(bin_path, new_bin_path) {
+                            return Err(format!(
+                                "{role} couldn't copy {pronoun}self...\n{e:?}",
+                                role = ROLE.load(&true_role, &rng)?,
+                                pronoun = PRONOUN.load(&true_role, &rng)?,
+                            ))?;
+                        } else {
+                            // Just exit immediately on success, don't try to get too clever here~
+                            eprintln!("{true_role} is now {new_role}~");
+                            return Ok(0);
+                        }
+                    } else {
+                        return Err(format!(
+                            "{role} couldn't copy {pronoun}self...\n(couldn't find own parent dir)",
+                            role = ROLE.load(&true_role, &rng)?,
+                            pronoun = PRONOUN.load(&true_role, &rng)?,
+                        ))?;
+                    }
+                }
+            }
+        }
+    }
+
+    // Time for mommy to call cargo~
     let mut cmd = std::process::Command::new(cargo);
-    cmd.args(arg_iter);
+    cmd.args(speculated.into_iter().chain(arg_iter));
     let status = cmd.status()?;
     let code = status.code().unwrap_or(-1);
     if is_quiet_mode_enabled(cmd.get_args()) {
         return Ok(code);
     }
 
+    // Time for mommy to tell you how you did~
     let response = if status.success() {
-        select_response(ResponseType::Positive)
+        select_response(&true_role, &rng, ResponseType::Positive)
     } else {
-        select_response(ResponseType::Negative)
+        select_response(&true_role, &rng, ResponseType::Negative)
     };
 
-    match response {
-        Ok(resp) => eprintln!("\x1b[1m{resp}\x1b[0m"),
-        Err(resp) => eprintln!("\x1b[31m{resp}\x1b[0m"),
+    let stylize = std::io::stderr().is_terminal();
+    match (response, stylize) {
+        (Ok(resp), true) => eprintln!("\x1b[1m{resp}\x1b[0m"),
+        (Err(resp), true) => eprintln!("\x1b[31m{resp}\x1b[0m"),
+        (Ok(resp) | Err(resp), false) => eprintln!("{resp}"),
     }
 
     Ok(code)
@@ -63,111 +164,44 @@ fn is_quiet_mode_enabled(args: std::process::CommandArgs) -> bool {
     false
 }
 
-fn select_response(response_type: ResponseType) -> Result<String, String> {
-    let rng = Rng::new();
-
-    // Get mommy's options~
-
+fn select_response(
+    true_role: &str,
+    rng: &Rng,
+    response_type: ResponseType,
+) -> Result<String, String> {
     // Choose what mood mommy is in~
-    const MOMMYS_MOODS_ENV_VAR: &str = "CARGO_MOMMYS_MOODS";
-    const MOMMYS_MOODS_DEFAULT: &str = "chill";
-    let mommys_moods = parse_options(MOMMYS_MOODS_ENV_VAR, MOMMYS_MOODS_DEFAULT);
-    let mood = &mommys_moods[rng.usize(..mommys_moods.len())];
+    let mood = MOOD.load(true_role, rng)?;
 
-    let Some(responses) = &RESPONSES
-        .iter()
-        .find(|(mood_mode, _)| mood_mode == mood)
-        .map(|x| x.1)
-    else {
-        let supported_moods_str = RESPONSES
+    let Some(group) = &CONFIG.moods.iter().find(|group| group.name == mood) else {
+        let supported_moods_str = CONFIG
+            .moods
             .iter()
-            .map(|(mood, _)| *mood)
+            .map(|group| group.name)
             .collect::<Vec<_>>()
             .join(", ");
         return Err(format!(
-            "Unknown mood {mood}! We were compiled with: {supported_moods_str}"
+            "{role} doesn't know how to feel {mood}... {pronoun} moods are {supported_moods_str}",
+            role = ROLE.load(true_role, rng)?,
+            pronoun = PRONOUN.load(true_role, rng)?,
         ));
     };
 
     // Choose what mommy will say~
     let responses = match response_type {
-        ResponseType::Positive => responses[0],
-        ResponseType::Negative => responses[1],
+        ResponseType::Positive => group.positive,
+        ResponseType::Negative => group.negative,
     };
     let response = &responses[rng.usize(..responses.len())];
 
     // Apply options to the message template~
-    let response = {
-        const AFFECTIONATE_TERMS_ENV_VAR: &str = "CARGO_MOMMYS_LITTLE";
-        const AFFECTIONATE_TERMS_DEFAULT: &str = "girl";
-        const AFFECTIONATE_TERM_PLACEHOLDER: &str = "AFFECTIONATE_TERM";
-        let affectionate_terms =
-            parse_options(AFFECTIONATE_TERMS_ENV_VAR, AFFECTIONATE_TERMS_DEFAULT);
+    let mut response = CONFIG.apply_template(true_role, response, rng)?;
 
-        apply_template(
-            response,
-            AFFECTIONATE_TERM_PLACEHOLDER,
-            &affectionate_terms,
-            &rng,
-        )
-    };
-
-    #[cfg(feature = "yikes")]
-    let response = {
-        const DENIGRATING_TERMS_ENV_VAR: &str = "CARGO_MOMMYS_FUCKING";
-        const DENIGRATING_TERMS_DEFAULT: &str = "slut/toy/pet/pervert/whore";
-        const DENIGRATING_TERM_PLACEHOLDER: &str = "DENIGRATING_TERM";
-        let denigrating_terms = parse_options(DENIGRATING_TERMS_ENV_VAR, DENIGRATING_TERMS_DEFAULT);
-        apply_template(
-            &response,
-            DENIGRATING_TERM_PLACEHOLDER,
-            &denigrating_terms,
-            &rng,
-        )
-    };
-
-    #[cfg(feature = "yikes")]
-    let response = {
-        const MOMMYS_PARTS_ENV_VAR: &str = "CARGO_MOMMYS_PARTS";
-        const MOMMYS_PARTS_DEFAULT: &str = "milk";
-        const MOMMYS_PART_PLACEHOLDER: &str = "MOMMYS_PART";
-        let mommys_parts = parse_options(MOMMYS_PARTS_ENV_VAR, MOMMYS_PARTS_DEFAULT);
-        apply_template(&response, MOMMYS_PART_PLACEHOLDER, &mommys_parts, &rng)
-    };
-
-    let response = {
-        const MOMMYS_PRONOUNS_ENV_VAR: &str = "CARGO_MOMMYS_PRONOUNS";
-        const MOMMYS_PRONOUN_PLACEHOLDER: &str = "MOMMYS_PRONOUN";
-        const MOMMYS_PRONOUNS_DEFAULT: &str = "her";
-        let mommys_pronouns = parse_options(MOMMYS_PRONOUNS_ENV_VAR, MOMMYS_PRONOUNS_DEFAULT);
-
-        apply_template(
-            &response,
-            MOMMYS_PRONOUN_PLACEHOLDER,
-            &mommys_pronouns,
-            &rng,
-        )
-    };
-
-    let mut response = {
-        const MOMMYS_ROLES_DEFAULT: &str = "mommy";
-        const MOMMYS_ROLES_ENV_VAR: &str = "CARGO_MOMMYS_ROLES";
-        const MOMMYS_ROLE_PLACEHOLDER: &str = "MOMMYS_ROLE";
-        let mommys_roles = parse_options(MOMMYS_ROLES_ENV_VAR, MOMMYS_ROLES_DEFAULT);
-        apply_template(&response, MOMMYS_ROLE_PLACEHOLDER, &mommys_roles, &rng)
-    };
-
-    {
-        const MOMMYS_EMOTES_ENV_VAR: &str = "CARGO_MOMMYS_EMOTES";
-        const MOMMYS_EMOTES_DEFAULT: &str = "❤️/💖/💗/💓/💞";
-        let mommys_emotes = parse_options(MOMMYS_EMOTES_ENV_VAR, MOMMYS_EMOTES_DEFAULT);
-
-        let should_emote = rng.bool();
-        if should_emote && !mommys_emotes.is_empty() {
-            let mommys_emotes = parse_options(MOMMYS_EMOTES_ENV_VAR, MOMMYS_EMOTES_DEFAULT);
-            let emote = &mommys_emotes[rng.usize(..mommys_emotes.len())];
+    // Let mommy show a little emote~
+    let should_emote = rng.bool();
+    if should_emote {
+        if let Ok(emote) = EMOTE.load(true_role, rng) {
             response.push(' ');
-            response.push_str(emote);
+            response.push_str(&emote);
         }
     }
 
@@ -175,24 +209,95 @@ fn select_response(response_type: ResponseType) -> Result<String, String> {
     Ok(response)
 }
 
-fn parse_options(env_var: &str, default: &str) -> Vec<String> {
-    std::env::var(env_var)
-        .unwrap_or_else(|_| default.to_owned())
-        .split('/')
-        .map(|s| s.to_owned())
-        .collect()
+// Mommy generates CONFIG and other global constants in build.rs~
+include!(concat!(env!("OUT_DIR"), "/responses.rs"));
+
+struct Config<'a> {
+    vars: &'a [Var<'a>],
+    moods: &'a [Mood<'a>],
 }
 
-fn apply_template(input: &str, template_key: &str, options: &[String], rng: &Rng) -> String {
-    let mut last_position = 0;
-    let mut output = String::new();
-    for (index, matched) in input.match_indices(template_key) {
-        output.push_str(&input[last_position..index]);
-        output.push_str(&options[rng.usize(..options.len())]);
-        last_position = index + matched.len();
+impl Config<'_> {
+    /// Applies a template by resolving `Chunk::Var`s against `self.vars`.
+    fn apply_template(
+        &self,
+        true_role: &str,
+        chunks: &[Chunk],
+        rng: &Rng,
+    ) -> Result<String, String> {
+        let mut out = String::new();
+        for chunk in chunks {
+            match chunk {
+                Chunk::Text(text) => out.push_str(text),
+                Chunk::Var(i) => out.push_str(&self.vars[*i].load(true_role, rng)?),
+            }
+        }
+        Ok(out)
     }
-    output.push_str(&input[last_position..]);
-    output
+}
+
+struct Mood<'a> {
+    name: &'a str,
+    // Each of mommy's response templates is an alternating sequence of
+    // Text and Var chunks; Text is literal text that should be printed as-is;
+    // Var is an index into mommy's CONFIG.vars table~
+    positive: &'a [&'a [Chunk<'a>]],
+    negative: &'a [&'a [Chunk<'a>]],
+}
+
+enum Chunk<'a> {
+    Text(&'a str),
+    Var(usize),
+}
+
+struct Var<'a> {
+    env_key: &'a str,
+    defaults: &'a [&'a str],
+}
+
+impl Var<'_> {
+    /// Loads this variable and selects one of the possible values for it;
+    /// produces an in-character error message on failure.
+    fn load(&self, true_role: &str, rng: &Rng) -> Result<String, String> {
+        // try to load custom settings from env vars~
+        let var = std::env::var(self.env(true_role));
+        let split;
+
+        // parse the custom settings or use the builtins~
+        let choices = match var.as_deref() {
+            Ok("") => &[],
+            Ok(value) => {
+                split = value.split('/').collect::<Vec<_>>();
+                split.as_slice()
+            }
+            Err(_) => self.defaults,
+        };
+
+        if choices.is_empty() {
+            // If there's no ROLES set, default to mommy's true nature~
+            if self.env_key == "ROLES" {
+                return Ok(true_role.to_owned());
+            }
+
+            // Otherwise, report an error~
+            let role = ROLE.load(true_role, rng)?;
+            return Err(format!(
+                "{role} needs at least one value for {}~",
+                self.env_key
+            ));
+        }
+
+        // now select a choice from the options~
+        Ok(choices[rng.usize(..choices.len())].to_owned())
+    }
+
+    /// Gets the name of the env var to load~
+    fn env(&self, true_role: &str) -> String {
+        // Normally we'd load from CARGO_MOMMYS_*
+        // but if cargo-mommy is cargo-daddy, we should load CARGO_DADDYS_* instead~
+        let screaming_role = true_role.to_ascii_uppercase();
+        format!("CARGO_{screaming_role}S_{}", self.env_key)
+    }
 }
 
 #[cfg(test)]
